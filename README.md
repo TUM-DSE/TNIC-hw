@@ -232,7 +232,7 @@ sudo insmod ./driver/coyote_drv.ko ip_addr_q0=0a000002 mac_addr_q0=000A350E24F2
 sudo DEVICE_1_IP_ADDRESS_0=10.0.0.2 ./sw/build/main -t 131.159.102.20 -w 1
 ```
 
-A simple demo should run that measures latency and throughput.
+This standalone experiment measures the latency and throughput.
 A snapshot of the data in host memory is saved after each benchmark step in the file `hmem-*.txt`, where `*` depends on the mode (RDMA or local operation) and for RDMA if the machine is the server (Amy) or the initiator (Clara).
 
 You can find the code in `sw/examples/perf_rdma/main.cpp`.
