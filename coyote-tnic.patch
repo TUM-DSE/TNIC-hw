@@ -1,0 +1,685 @@
+diff --git a/driver/fpga_dev.c b/driver/fpga_dev.c
+index 611668a..17df08e 100644
+--- a/driver/fpga_dev.c
++++ b/driver/fpga_dev.c
+@@ -310,7 +310,11 @@ int init_char_devices(struct bus_drvdata *d, dev_t dev)
+     pr_info("virtual FPGA device regions allocated, major number %d\n", fpga_major);
+ 
+     // create device class
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0)
++    fpga_class = class_create(DEV_NAME);
++#else
+     fpga_class = class_create(THIS_MODULE, DEV_NAME);
++#endif
+ 
+     // virtual FPGA devices
+     d->fpga_dev = kmalloc(d->n_fpga_reg * sizeof(struct fpga_dev), GFP_KERNEL);
+diff --git a/driver/fpga_mmu.c b/driver/fpga_mmu.c
+index ae1d96f..c46c07d 100644
+--- a/driver/fpga_mmu.c
++++ b/driver/fpga_mmu.c
+@@ -855,7 +855,9 @@ int tlb_get_user_pages(struct fpga_dev *d, uint64_t start, size_t count, int32_t
+     }
+ 
+     // pin
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)
++    ret_val = get_user_pages_remote(curr_mm, (unsigned long)start, n_pages, 1, user_pg->hpages, NULL);
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
+     ret_val = get_user_pages_remote(curr_mm, (unsigned long)start, n_pages, 1, user_pg->hpages, NULL, NULL);
+ #else 
+     ret_val = get_user_pages_remote(curr_task, curr_mm, (unsigned long)start, n_pages, 1, user_pg->hpages, NULL, NULL);
+@@ -1005,4 +1007,4 @@ fail_card_unmap:
+     kfree(user_pg->cpages);
+ 
+     return -ENOMEM;
+-}
+\ No newline at end of file
++}
+diff --git a/sw/examples/perf_rdma/main.cpp b/sw/examples/perf_rdma/main.cpp
+index 5265853..4df7c6d 100644
+--- a/sw/examples/perf_rdma/main.cpp
++++ b/sw/examples/perf_rdma/main.cpp
+@@ -1,20 +1,20 @@
+ #include "cDefs.hpp"
+ 
+-#include <iostream>
+-#include <string>
+-#include <malloc.h>
+-#include <time.h> 
+-#include <sys/time.h>  
++#include <atomic>
++#include <boost/program_options.hpp>
+ #include <chrono>
+-#include <fstream>
++#include <cstring>
+ #include <fcntl.h>
+-#include <unistd.h>
++#include <fstream>
+ #include <iomanip>
++#include <iostream>
++#include <malloc.h>
+ #include <random>
+-#include <cstring>
+-#include <atomic>
+-#include <signal.h> 
+-#include <boost/program_options.hpp>
++#include <signal.h>
++#include <string>
++#include <sys/time.h>
++#include <time.h>
++#include <unistd.h>
+ 
+ #include "cBench.hpp"
+ #include "ibvQpMap.hpp"
+@@ -26,227 +26,224 @@ using namespace std;
+ using namespace std::chrono;
+ using namespace fpga;
+ 
++enum class Mode {
++    RDMA = 0,
++    LOOPBACK_ATTEST = 1,
++    LOOPBACK_VERIFY = 2,
++};
++
+ /* Signal handler */
+-std::atomic<bool> stalled(false); 
+-void gotInt(int) {
+-    stalled.store(true);
+-}
++std::atomic<bool> stalled(false);
++void gotInt(int) { stalled.store(true); }
+ 
+ /* Params */
+-constexpr auto const targetRegion = 0;
+-constexpr auto const qpId = 0;
+-constexpr auto const port = 18488;
++constexpr auto targetRegion = 0;
++constexpr auto qpId = 0;
++constexpr auto port = 18488;
+ 
+ /* Bench */
+-constexpr auto const defNBenchRuns = 1; 
+-constexpr auto const defNRepsThr = 1000;
+-constexpr auto const defNRepsLat = 100;
+-constexpr auto const defMinSize = 128;
+-constexpr auto const defMaxSize = 32 * 1024;
+-constexpr auto const defOper = 0;
+-
+-int main(int argc, char *argv[])  
+-{
+-    // ---------------------------------------------------------------
+-    // Initialization 
+-    // ---------------------------------------------------------------
++constexpr auto defNBenchRuns = 1;
++constexpr auto defNRepsThr = 10'000;
++constexpr auto defNRepsLat = 10'000;
++constexpr auto defMinSize = 128;
++constexpr auto defMaxSize = 8 * 1024;
++constexpr auto defOper = 1;
++constexpr auto defMode = Mode::RDMA;
+ 
+-    // Sig handler
+-    struct sigaction sa;
+-    memset( &sa, 0, sizeof(sa) );
+-    sa.sa_handler = gotInt;
+-    sigfillset(&sa.sa_mask);
+-    sigaction(SIGINT,&sa,NULL);
++string tcp_mstr_ip;
++uint32_t n_bench_runs = defNBenchRuns;
++uint32_t n_reps_thr = defNRepsThr;
++uint32_t n_reps_lat = defNRepsLat;
++uint32_t min_size = defMinSize;
++uint32_t max_size = defMaxSize;
++bool oper = defOper;
++bool mstr = true;
++Mode mode = defMode;
++uint32_t n_pages;
++string ibv_ip;
++uint64_t hmem_size;
++std::ofstream hmem_file;
+ 
+-    // Read arguments
+-    boost::program_options::options_description programDescription("Options:");
+-    programDescription.add_options()
+-        ("tcpaddr,t", boost::program_options::value<string>(), "TCP conn IP")
+-        ("benchruns,b", boost::program_options::value<uint32_t>(), "Number of bench runs")
+-        ("repst,r", boost::program_options::value<uint32_t>(), "Number of throughput repetitions within a run")
+-        ("repsl,l", boost::program_options::value<uint32_t>(), "Number of latency repetitions within a run")
+-        ("mins,n", boost::program_options::value<uint32_t>(), "Minimum transfer size")
+-        ("maxs,x", boost::program_options::value<uint32_t>(), "Maximum transfer size")
+-        ("oper,w", boost::program_options::value<bool>(), "Read or Write");
+-    
+-    boost::program_options::variables_map commandLineArgs;
+-    boost::program_options::store(boost::program_options::parse_command_line(argc, argv, programDescription), commandLineArgs);
+-    boost::program_options::notify(commandLineArgs);
+-
+-    // Stat
+-    string tcp_mstr_ip;
+-    uint32_t n_bench_runs = defNBenchRuns;
+-    uint32_t n_reps_thr = defNRepsThr;
+-    uint32_t n_reps_lat = defNRepsLat;
+-    uint32_t min_size = defMinSize;
+-    uint32_t max_size = defMaxSize;
+-    bool oper = defOper;
+-    bool mstr = true;
+-
+-    char const* env_var_ip = std::getenv("DEVICE_1_IP_ADDRESS_0");
+-    if(env_var_ip == nullptr) 
+-        throw std::runtime_error("IBV IP address not provided");
+-    string ibv_ip(env_var_ip);
+-
+-    if(commandLineArgs.count("tcpaddr") > 0) {
+-        tcp_mstr_ip = commandLineArgs["tcpaddr"].as<string>();
+-        mstr = false;
++/**
++ * @brief Print content of host memory to file
++ *
++ * @param hmem Pointer to start of host memory
++ * @param hmem_size Size of hmem in bytes
++ * @param file File to write into
++ */
++void print_hmem_to_file(const uint64_t *hmem, uint64_t hmem_size, std::ofstream &file) {
++    for (uint64_t i = 0; i < hmem_size; i++) {
++        file << std::hex << std::setw(16) << std::setfill('0') << hmem[i];
++        if ((i + 1) % 8 == 0) {
++            file << '\n';
++        } else {
++            file << ' ';
++        }
+     }
+-    
+-    if(commandLineArgs.count("benchruns") > 0) n_bench_runs = commandLineArgs["benchruns"].as<uint32_t>();
+-    if(commandLineArgs.count("repst") > 0) n_reps_thr = commandLineArgs["repst"].as<uint32_t>();
+-    if(commandLineArgs.count("repsl") > 0) n_reps_lat = commandLineArgs["repsl"].as<uint32_t>();
+-    if(commandLineArgs.count("mins") > 0) min_size = commandLineArgs["mins"].as<uint32_t>();
+-    if(commandLineArgs.count("maxs") > 0) max_size = commandLineArgs["maxs"].as<uint32_t>();
+-    if(commandLineArgs.count("oper") > 0) oper = commandLineArgs["oper"].as<bool>();
+-
+-    uint32_t n_pages = (max_size + hugePageSize - 1) / hugePageSize;
+-    uint32_t size = min_size;
++}
+ 
+-    PR_HEADER("PARAMS");
+-    if(!mstr) { std::cout << "TCP master IP address: " << tcp_mstr_ip << std::endl; }
+-    std::cout << "IBV IP address: " << ibv_ip << std::endl;
+-    std::cout << "Number of allocated pages: " << n_pages << std::endl;
+-    std::cout << (oper ? "Write operation" : "Read operation") << std::endl;
+-    std::cout << "Min size: " << min_size << std::endl;
+-    std::cout << "Max size: " << max_size << std::endl;
+-    std::cout << "Number of throughput reps: " << n_reps_thr << std::endl;
+-    std::cout << "Number of latency reps: " << n_reps_lat << std::endl;
+-    
++/**
++ * @brief Perform throughput and latency benchmarks on rdma between two hosts
++ *
++ */
++void bench_rdma() {
+     // Create  queue pairs
+     ibvQpMap ictx;
+     ictx.addQpair(qpId, targetRegion, ibv_ip, n_pages);
+     mstr ? ictx.exchangeQpMaster(port) : ictx.exchangeQpSlave(tcp_mstr_ip.c_str(), port);
+     ibvQpConn *iqp = ictx.getQpairConn(qpId);
+-    cProcess *cproc = iqp->getCProc();
+ 
+-    // Init app layer --------------------------------------------------------------------------------
++    // Init app layer
++    // --------------------------------------------------------------------------------
+     struct ibvSge sg;
+     struct ibvSendWr wr;
+-    
++
+     memset(&sg, 0, sizeof(sg));
+     sg.local_offs = 0;
+     sg.remote_offs = 0;
+-    sg.len = size;
++    sg.len = min_size;
+ 
+     memset(&wr, 0, sizeof(wr));
+     wr.sg_list = &sg;
+     wr.num_sge = 1;
+     wr.opcode = oper ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+- 
+-    uint64_t *hMem = (uint64_t*)iqp->getQpairStruct()->local.vaddr;
++
++    uint64_t *hMem = (uint64_t *)iqp->getQpairStruct()->local.vaddr;
+     iqp->ibvSync(mstr);
+ 
+     // Fill the data
+-    for(int i = 0; i < max_size/64; i++) {
+-      for(int j = 0; j < 8; j++) {
+-	      hMem[i*8+j] = i;
+-      } 
+-    } 
+-    
++    for (uint32_t i = 0; i < max_size / 64; i++) {
++        for (int j = 0; j < 8; j++) {
++            hMem[i * 8 + j] = i;
++        }
++    }
++
++    // Set mode in FPGA user logic
++    iqp->getCProc()->setCSR(static_cast<uint64_t>(mode), 0);
++
++    hmem_file << "Before benchmark:\n";
++    print_hmem_to_file(hMem, hmem_size, hmem_file);
++
+     PR_HEADER("RDMA BENCHMARK");
+-    while(sg.len <= max_size) {
++    while (sg.len <= max_size) {
+         // Setup
+         iqp->ibvClear();
+         iqp->ibvSync(mstr);
+ 
+-        // Measurements ----------------------------------------------------------------------------------
+-        if(mstr) {
+-            // Inititator 
+-	    //
+-	    //cproc->netDrop(1, 0, 0);
+-	    //cproc->netDrop(0, 1, 0);
+-            
++        if (mstr) {
++            // Inititator
+             // ---------------------------------------------------------------
+-            // Runs 
++            // Runs
+             // ---------------------------------------------------------------
+             cBench bench(n_bench_runs);
+             uint32_t n_runs = 0;
+ 
+-#ifdef EN_THR_TESTS    
++            std::cout << std::setw(8) << sg.len << " [bytes], " << std::flush;
++
++#ifdef EN_THR_TESTS
+             auto benchmark_thr = [&]() {
+-                bool k = false;
+                 n_runs++;
+-                
++
+                 // Initiate
+-                for(int i = 0; i < n_reps_thr; i++) {
++                for (uint32_t i = 0; i < n_reps_thr; i++) {
+                     iqp->ibvPostSend(&wr);
+                 }
+ 
+                 // Wait for completion
+-                while(iqp->ibvDone() < n_reps_thr * n_runs) { if( stalled.load() ) throw std::runtime_error("Stalled, SIGINT caught");  }
++                while (iqp->ibvDone() < n_reps_thr * n_runs) {
++                    if (stalled.load())
++                        throw std::runtime_error("Stalled, SIGINT caught");
++                }
+             };
+             bench.runtime(benchmark_thr);
+-            std::cout << std::fixed << std::setprecision(2);
+-            std::cout << std::setw(8) << sg.len << " [bytes], thoughput: " 
+-                      << std::setw(8) << ((1 + oper) * ((1000 * sg.len))) / ((bench.getAvg()) / n_reps_thr) << " [MB/s], latency: "; 
++            std::cout << "throughput: " << std::setw(8)
++                      << ((1 + oper) * ((1000 * sg.len))) / ((bench.getAvg()) / n_reps_thr)
++                      << " [MB/s], " << std::flush;
++
++            hmem_file << "\nAfter throughput benchmark (len = 0x" << sg.len << ")\n";
++            print_hmem_to_file(hMem, hmem_size, hmem_file);
++#endif
++#ifndef EN_LAT_TESTS
++            std::cout << '\n';
+ #endif
+-            
++
+             // Reset
+             iqp->ibvClear();
+             n_runs = 0;
+-            //std::cout << "\e[1mSyncing ...\e[0m" << std::endl;
+             iqp->ibvSync(mstr);
+ 
+-#ifdef EN_LAT_TESTS           
++#ifdef EN_LAT_TESTS
+             auto benchmark_lat = [&]() {
+                 n_runs++;
+-                
++
+                 // Initiate and wait for completion
+-                for(int i = 0; i < n_reps_lat; i++) {
++                for (uint32_t i = 0; i < n_reps_lat; i++) {
+                     iqp->ibvPostSend(&wr);
+-                    while(iqp->ibvDone() < (i+1) + ((n_runs-1) * n_reps_lat)) { if( stalled.load() ) throw std::runtime_error("Stalled, SIGINT caught");  }
++                    while (iqp->ibvDone() < (i + 1) + ((n_runs - 1) * n_reps_lat)) {
++                        if (stalled.load())
++                            throw std::runtime_error("Stalled, SIGINT caught");
++                    }
+                 }
+             };
+             bench.runtime(benchmark_lat);
+-	    std::cout << (bench.getAvg()) / (n_reps_lat * (1 + oper)) << " [ns]" << std::endl;
+-#endif	    
++            std::cout << "latency: " << (bench.getAvg()) / (n_reps_lat * (1 + oper)) << " [ns]"
++                      << std::endl;
++
++            hmem_file << "\nAfter latency benchmark (len = 0x" << sg.len << ")\n";
++            print_hmem_to_file(hMem, hmem_size, hmem_file);
++#endif
+ 
+         } else {
+             // Server
+ 
++            if (oper) {
+ #ifdef EN_THR_TESTS
+-            if(oper) {
+-                for(uint32_t n_runs = 1; n_runs <= n_bench_runs; n_runs++) {
+-                    bool k = false;
+-                    
++                for (uint32_t n_runs = 1; n_runs <= n_bench_runs; n_runs++) {
+                     // Wait for incoming transactions
+-                    while(iqp->ibvDone() < n_reps_thr * n_runs) { if( stalled.load() ) throw std::runtime_error("Stalled, SIGINT caught");  }
++                    while (iqp->ibvDone() < n_reps_thr * n_runs) {
++                        if (stalled.load())
++                            throw std::runtime_error("Stalled, SIGINT caught");
++                    }
+ 
+                     // Send back
+-                    for(int i = 0; i < n_reps_thr; i++) {
++                    for (uint32_t i = 0; i < n_reps_thr; i++) {
+                         iqp->ibvPostSend(&wr);
+                     }
+                 }
++
++                hmem_file << "\nAfter throughput benchmark (len = 0x" << sg.len << ")\n";
++                print_hmem_to_file(hMem, hmem_size, hmem_file);
+ #endif
+ 
+                 // Reset
+                 iqp->ibvClear();
+-                //std::cout << "\e[1mSyncing ...\e[0m" << std::endl;
+                 iqp->ibvSync(mstr);
+ 
+ #ifdef EN_LAT_TESTS
+-                for(int n_runs = 1; n_runs <= n_bench_runs; n_runs++) {
+-                    
++                for (uint32_t n_runs = 1; n_runs <= n_bench_runs; n_runs++) {
++
+                     // Wait for the incoming transaction and send back
+-                    for(int i = 0; i < n_reps_lat; i++) {
+-                        while(iqp->ibvDone() < (i+1) + ((n_runs-1) * n_reps_lat)) { if( stalled.load() ) throw std::runtime_error("Stalled, SIGINT caught");  }
++                    for (uint32_t i = 0; i < n_reps_lat; i++) {
++                        while (iqp->ibvDone() < (i + 1) + ((n_runs - 1) * n_reps_lat)) {
++                            if (stalled.load())
++                                throw std::runtime_error("Stalled, SIGINT caught");
++                        }
+                         iqp->ibvPostSend(&wr);
+                     }
+-                } 
+-#endif		
++                }
++
++                hmem_file << "\nAfter latency benchmark (len = 0x" << sg.len << ")\n";
++                print_hmem_to_file(hMem, hmem_size, hmem_file);
++#endif
+ 
+             } else {
+-                //std::cout << "\e[1mSyncing ...\e[0m" << std::endl;
+                 iqp->ibvSync(mstr);
+             }
+-        }  
++        }
+ 
+-        //std::cout << std::endl << std::endl << "ACKs: " << cproc->ibvCheckAcks() << std::endl;
+         sg.len *= 2;
+     }
+     std::cout << std::endl;
+-    
+ 
+     // Done
+     if (mstr) {
+@@ -256,6 +253,222 @@ int main(int argc, char *argv[])
+         iqp->readAck();
+         iqp->closeConnection();
+     }
++}
++
++/**
++ * @brief Perform throughput and latency benchmarks between host and fpga locally
++ *
++ */
++void bench_loopback() {
++    auto cproc = new cProcess(0, getpid());
++    auto hMem = (uint64_t *)cproc->getMem({CoyoteAlloc::HOST_2M, n_pages});
++
++    // Fill the data
++    for (uint32_t i = 0; i < max_size / 64; i++) {
++        for (int j = 0; j < 8; j++) {
++            hMem[i * 8 + j] = i;
++        }
++    }
++
++    // Example values for testing local verify mode.
++    // Set min_size = max_size = 1024, n_reps_thr = 1, and define EN_THR_TESTS.
++    // In the hmem file, "Before benchmark" and "After throughput benchmark (len = 0x400)"
++    // should show the same numbers. If counter, IDs, or HMAC are incorrect, the numbers
++    // after the benchmark should be all zero.
++
++    // // Second to last packet contains metadata
++    // hMem[112] = 0; // Counter
++    // hMem[113] = 0xdeadbeef98765432; // Connection ID
++    // hMem[114] = 0xc0ffee0123456789; // FPGA ID
++    // hMem[115] = 0; // Remaining 40 bytes are unused but have to be 0 for HMAC to be correct
++    // hMem[116] = 0;
++    // hMem[117] = 0;
++    // hMem[118] = 0;
++    // hMem[119] = 0;
++    // // Last packet contains HMAC
++    // hMem[120] = 0x67ffcc5e6f4a66a3; // 48 bytes HMAC
++    // hMem[121] = 0x2417aef69f71424a;
++    // hMem[122] = 0x010a386a1e3db995;
++    // hMem[123] = 0x34cacc5bb6c445b5;
++    // hMem[124] = 0xbe4eb2e34670895b;
++    // hMem[125] = 0xbb18c6df331e613e;
++    // hMem[126] = 0; // Last 16 bytes have to be 0
++    // hMem[127] = 0;
++
++    uint32_t curr_size = min_size;
++
++    // Set mode in FPGA user logic
++    cproc->setCSR(static_cast<uint64_t>(mode), 0);
++
++    // ---------------------------------------------------------------
++    // Runs
++    // ---------------------------------------------------------------
++    cBench bench(n_bench_runs);
++    uint32_t n_runs;
++
++    hmem_file << "Before benchmark:\n";
++    print_hmem_to_file(hMem, hmem_size, hmem_file);
++
++    PR_HEADER("LOCAL BENCHMARK");
++    while (curr_size <= max_size) {
++        cproc->clearCompleted();
++        n_runs = 0;
++
++        std::cout << std::setw(8) << curr_size << " [bytes], " << std::flush;
++
++#ifdef EN_THR_TESTS
++        auto benchmark_thr = [&]() {
++            n_runs++;
++
++            // Transfer the data
++            for (uint32_t i = 0; i < n_reps_thr; i++) {
++                cproc->invoke({CoyoteOper::TRANSFER, hMem, hMem, curr_size, curr_size, false, false});
++            }
++
++            while (cproc->checkCompleted(CoyoteOper::TRANSFER) != n_reps_thr * n_runs) {
++                if (stalled.load())
++                    throw std::runtime_error("Stalled, SIGINT caught");
++            }
++        };
++        bench.runtime(benchmark_thr);
++        std::cout << "throughput: " << std::setw(8)
++                  << (1000 * curr_size) / (bench.getAvg() / n_reps_thr) << " [MB/s], "
++                  << std::flush;
++
++        hmem_file << "\nAfter throughput benchmark (len = 0x" << curr_size << ")\n";
++        print_hmem_to_file(hMem, hmem_size, hmem_file);
++#endif
++#ifndef EN_LAT_TESTS
++        std::cout << '\n';
++#endif
++
++        // No reset of variables necessary, see cproc->invoke call below
++
++#ifdef EN_LAT_TESTS
++        auto benchmark_lat = [&]() {
++            n_runs++;
++
++            for (uint32_t i = 0; i < n_reps_lat; i++) {
++                // Flag clr_stat = true, so number of completed operations is reset before transfer
++                cproc->invoke({CoyoteOper::TRANSFER, hMem, hMem, curr_size, curr_size, true, false});
++                while (cproc->checkCompleted(CoyoteOper::TRANSFER) != 1) {
++                    if (stalled.load())
++                        throw std::runtime_error("Stalled, SIGINT caught");
++                }
++            }
++        };
++        bench.runtime(benchmark_lat);
++        std::cout << "latency: " << setw(8) << (bench.getAvg() / n_reps_lat) << " [ns]"
++                  << std::endl;
++
++        hmem_file << "\nAfter latency benchmark (len = 0x" << curr_size << ")\n";
++        print_hmem_to_file(hMem, hmem_size, hmem_file);
++#endif
++
++        curr_size *= 2;
++    }
++}
++
++int main(int argc, char *argv[]) {
++    // Sig handler
++    struct sigaction sa;
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_handler = gotInt;
++    sigfillset(&sa.sa_mask);
++    sigaction(SIGINT, &sa, NULL);
++
++    // Read arguments
++    boost::program_options::options_description programDescription("Options:");
++    programDescription.add_options()
++        ("tcpaddr,t", boost::program_options::value<string>(), "TCP conn IP")
++        ("benchruns,b", boost::program_options::value<uint32_t>(), "Number of bench runs")
++        ("repst,r", boost::program_options::value<uint32_t>(), "Number of throughput repetitions within a run")
++        ("repsl,l", boost::program_options::value<uint32_t>(), "Number of latency repetitions within a run")
++        ("mins,n", boost::program_options::value<uint32_t>(), "Minimum transfer size")
++        ("maxs,x", boost::program_options::value<uint32_t>(), "Maximum transfer size")
++        ("oper,w", boost::program_options::value<bool>(), "Read or Write")
++        ("mode,m", boost::program_options::value<string>(), "Mode: rdma (default), loopback_attest, loopback_verify");
++
++    boost::program_options::variables_map commandLineArgs;
++    boost::program_options::store(
++        boost::program_options::parse_command_line(argc, argv, programDescription),
++        commandLineArgs);
++    boost::program_options::notify(commandLineArgs);
++
++    char const *env_var_ip = std::getenv("DEVICE_1_IP_ADDRESS_0");
++    if (env_var_ip == nullptr)
++        throw std::runtime_error("IBV IP address not provided");
++    ibv_ip = string{env_var_ip};
++
++    if (commandLineArgs.count("tcpaddr") > 0) {
++        tcp_mstr_ip = commandLineArgs["tcpaddr"].as<string>();
++        mstr = false;
++    }
++
++    if (commandLineArgs.count("benchruns") > 0)
++        n_bench_runs = commandLineArgs["benchruns"].as<uint32_t>();
++    if (commandLineArgs.count("repst") > 0)
++        n_reps_thr = commandLineArgs["repst"].as<uint32_t>();
++    if (commandLineArgs.count("repsl") > 0)
++        n_reps_lat = commandLineArgs["repsl"].as<uint32_t>();
++    if (commandLineArgs.count("mins") > 0)
++        min_size = commandLineArgs["mins"].as<uint32_t>();
++    if (commandLineArgs.count("maxs") > 0)
++        max_size = commandLineArgs["maxs"].as<uint32_t>();
++    if (commandLineArgs.count("oper") > 0)
++        oper = commandLineArgs["oper"].as<bool>();
++    if (commandLineArgs.count("mode") > 0) {
++        string mode_str = commandLineArgs["mode"].as<string>();
++        if (mode_str == "rdma") {
++            mode = Mode::RDMA;
++        } else if (mode_str == "loopback_attest") {
++            mode = Mode::LOOPBACK_ATTEST;
++        } else if (mode_str == "loopback_verify") {
++            mode = Mode::LOOPBACK_VERIFY;
++        } else {
++            throw std::runtime_error("Unknown mode: " + mode_str +
++                                     ". Valid modes: rdma, loopback_attest, loopback_verify");
++        }
++    }
++
++    n_pages = (max_size + hugePageSize - 1) / hugePageSize;
++
++    // A snapshot of the current host memory content will be saved to a file after each benchmark
++    hmem_size = max_size / sizeof(uint64_t);
++    string hmem_file_name;
++    if (mode == Mode::RDMA && mstr) {
++        hmem_file_name = "hmem-rdma-initiator.txt";
++    } else if (mode == Mode::RDMA && !mstr) {
++        hmem_file_name = "hmem-rdma-server.txt";
++    } else if (mode == Mode::LOOPBACK_ATTEST) {
++        hmem_file_name = "hmem-local-attest.txt";
++    } else {
++        hmem_file_name = "hmem-local-verify.txt";
++    }
++    hmem_file.open(hmem_file_name);
++
++    // Set format for benchmark outputs
++    std::cout << std::fixed << std::setprecision(2);
++
++    PR_HEADER("PARAMS");
++    if (!mstr) { std::cout << "TCP master IP address: " << tcp_mstr_ip << std::endl; }
++    std::cout << "IBV IP address: " << ibv_ip << std::endl;
++    std::cout << "Number of allocated pages: " << n_pages << std::endl;
++    std::cout << "Mode: " << (mode == Mode::RDMA            ? "RDMA" :
++                              mode == Mode::LOOPBACK_ATTEST ? "loopback attest"
++                                                            : "loopback verify") << std::endl;
++    std::cout << "Host memory snapshots: " << hmem_file_name << std::endl;
++    std::cout << (oper ? "Write operation" : "Read operation") << std::endl;
++    std::cout << "Min size: " << min_size << std::endl;
++    std::cout << "Max size: " << max_size << std::endl;
++    std::cout << "Number of throughput reps: " << n_reps_thr << std::endl;
++    std::cout << "Number of latency reps: " << n_reps_lat << std::endl;
++
++    if (mode == Mode::RDMA) {
++        bench_rdma();
++    } else {
++        bench_loopback();
++    }
+ 
+     return EXIT_SUCCESS;
+ }
+diff --git a/sw/include/cService.hpp b/sw/include/cService.hpp
+index df5a12e..b2224a8 100644
+--- a/sw/include/cService.hpp
++++ b/sw/include/cService.hpp
+@@ -28,6 +28,7 @@
+ #include <mutex>
+ #include <condition_variable>
+ #include <any>
++#include <functional>
+ 
+ #include "cSched.hpp"
+ #include "cThread.hpp"
+diff --git a/sw/src/ibvQpConn.cpp b/sw/src/ibvQpConn.cpp
+index 0369fba..5a9bcfb 100644
+--- a/sw/src/ibvQpConn.cpp
++++ b/sw/src/ibvQpConn.cpp
+@@ -109,12 +109,12 @@ void ibvQpConn::initLocalQueue(string ip_addr) {
+     // qpn and psn
+     qpair->local.qpn = ((fdev->getVfid() & nRegMask) << pidBits) | (fdev->getCpid() & pidMask);
+     if(qpair->local.qpn == -1) 
+-        throw std::runtime_error("Coyote PID incorrect, vfid: " + fdev->getVfid());
++        throw std::runtime_error("Coyote PID incorrect, vfid: " + std::to_string(fdev->getVfid()));
+     qpair->local.psn = distr(rand_gen) & 0xFFFFFF;
+     qpair->local.rkey = 0;
+ 
+     // Allocate buffer
+-    void *vaddr = fdev->getMem({CoyoteAlloc::HUGE_2M, n_pages});
++    void *vaddr = fdev->getMem({CoyoteAlloc::HOST_2M, n_pages});
+     qpair->local.vaddr = vaddr;
+     qpair->local.size = n_pages * hugePageSize;
+ }

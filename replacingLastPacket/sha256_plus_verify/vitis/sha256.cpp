@@ -1,0 +1,577 @@
+#include "sha256.hpp"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>  // for overloaded memcpy() function
+#include "sha256_impl.hpp"
+#include<iostream>
+
+//////
+/*
+ * Copyright 2019 Xilinx, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef _XF_SECURITY_ASYMMETRIC_CRYPTOGRAPHY_HPP_
+#define _XF_SECURITY_ASYMMETRIC_CRYPTOGRAPHY_HPP_
+
+#include <ap_int.h>
+// #include "xf_security/modular.hpp"
+
+/*
+ * Copyright 2019 Xilinx, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ *
+ * @file modular.hpp
+ * @brief header file for modular operators.
+ * This file is part of Vitis Security Library.
+ *
+ */
+
+#ifndef _XF_SECURITY_MODULAR_HPP_
+#define _XF_SECURITY_MODULAR_HPP_
+
+#include <ap_int.h>
+#include <hls_stream.h>
+
+#ifndef __SYNTHESIS__
+#include <iostream>
+#endif
+
+namespace xf {
+namespace security {
+namespace internal {
+
+/*
+ * @brief Montgomery Production of opA and opB and returns opA * opB * opM^-1 mod R
+ * Reference: "Efficient architectures for implementing montgomery modular multiplication and RSA modular exponentiation
+ * on reconfigurable logic" by Alan Daly, William Marnane
+ *
+ * @tparam N bit width of opA, opB and opM
+ *
+ * @param opA Montgomery representation of A
+ * @param opB Montgomery representation of B
+ * @param opM modulus
+ */
+template <int N>
+ap_uint<N> monProduct(ap_uint<N> opA, ap_uint<N> opB, ap_uint<N> opM) {
+    ap_uint<N + 2> s = 0;
+    ap_uint<1> a0 = opA[0];
+    for (int i = 0; i < N; i++) {
+#pragma HLS PIPELINE II=2
+        ap_uint<1> qa = opB[i];
+        ap_uint<1> qm = s[0] ^ (opB[i] & a0);
+        ap_uint<N> addA = qa == ap_uint<1>(1) ? opA : ap_uint<N>(0);
+        ap_uint<N> addM = qm == ap_uint<1>(1) ? opM : ap_uint<N>(0);
+        s += (addA + addM);
+        s >>= 1;
+    }
+    if (s > opM) {
+        s -= opM;
+    }
+    return s;
+}
+
+/*
+ * @brief Modular Exponentiation
+ *
+ * @tparam L bit width of base and modulus
+ * @tparam N bit width of exponent
+ *
+ * @param base Base of Modular Exponentiation
+ * @param exponent Exponent of Modular Exponentiation
+ * @param modulus Modulus of Modular Exponentiation
+ * @param rMod 2^(2*L) mod modulus could be pre-calculated.
+ */
+template <int L, int N>
+ap_uint<L> modularExp(ap_uint<L> base, ap_uint<N> exponent, ap_uint<L> modulus, ap_uint<L> rMod) {
+    ap_uint<L> P = monProduct<L>(rMod, base, modulus);
+    ap_uint<L> R = monProduct<L>(rMod, 1, modulus);
+    for (int i = N - 1; i >= 0; i--) {
+        R = monProduct<L>(R, R, modulus);
+        if (exponent[i] == 1) {
+            R = monProduct<L>(R, P, modulus);
+        }
+    }
+    return monProduct<L>(R, 1, modulus);
+}
+
+/*
+ * @brief modulo operation, returns remainder of dividend against divisor.
+ *
+ * @tparam L bit width of dividend
+ * @tparam N bit width of divisor
+ *
+ * @param dividend Dividend
+ * @param divisor Divisor
+ */
+template <int L, int N>
+ap_uint<N> simpleMod(ap_uint<L> dividend, ap_uint<N> divisor) {
+    ap_uint<N> remainder = dividend % divisor;
+    return remainder;
+}
+
+/**
+ * @brief return (opA * opB) mod opM
+ *
+ * @tparam N bit width of opA, opB and opM
+ *
+ * @param opA Product input, should be less than opM
+ * @param opB Product input, should be less than opM
+ * @param opM Modulus, should be larger than 2^(N-1)
+ */
+template <int N>
+ap_uint<N> productMod(ap_uint<N> opA, ap_uint<N> opB, ap_uint<N> opM) {
+    ap_uint<N + 1> tmp = 0;
+    for (int i = N - 1; i >= 0; i--) {
+#pragma HLS PIPELINE II=0
+        tmp <<= 1;
+        if (tmp > opM) {
+            tmp -= opM;
+        }
+        if (opB[i] == 1) {
+            tmp += opA;
+            if (tmp > opM) {
+                tmp -= opM;
+            }
+        }
+    }
+    return tmp;
+}
+
+/**
+ * @brief return (opA + opB) mod opM
+ *
+ * @tparam N bit width of opA, opB and opM
+ *
+ * @param opA Product input, should be less than opM
+ * @param opB Product input, should be less than opM
+ * @param opM Modulus
+ */
+template <int N>
+ap_uint<N> addMod(ap_uint<N> opA, ap_uint<N> opB, ap_uint<N> opM) {
+    ap_uint<N + 1> sum = opA + opB;
+    if (sum >= opM) {
+        sum -= opM;
+    }
+    return sum;
+}
+
+/**
+ * @brief return (opA - opB) mod opM
+ *
+ * @tparam N bit width of opA, opB and opM
+ *
+ * @param opA Product input, should be less than opM
+ * @param opB Product input, should be less than opM
+ * @param opM Modulus
+ */
+template <int N>
+ap_uint<N> subMod(ap_uint<N> opA, ap_uint<N> opB, ap_uint<N> opM) {
+    ap_uint<N + 1> sum;
+    if (opA >= opB) {
+        sum = opA - opB;
+    } else {
+        sum = opA + opM;
+        sum -= opB;
+    }
+    return sum;
+}
+
+/**
+ * @brief return montgomery inverse of opA
+ * Reference: "The Montgomery Modular Inverse - Revisited" by E Savas, CK Koç
+ *
+ * @tparam N bit width of opA and opM
+ *
+ * @param opA Input of modular inverse.
+ * @param opM Modulus of modular inverse.
+ */
+template <int N>
+ap_uint<N> monInv(ap_uint<N> opA, ap_uint<N> opM) {
+    // calc r = opA^-1 * 2^k and k
+    ap_uint<N> u = opM;
+    ap_uint<N> v = opA;
+    ap_uint<N> s = 1;
+    ap_uint<N + 1> r = 0;
+    ap_uint<32> k = 0;
+
+    while (v > 0) {
+        if (u[0] == 0) {
+            u >>= 1;
+            s <<= 1;
+        } else if (v[0] == 0) {
+            v >>= 1;
+            r <<= 1;
+        } else if (u > v) {
+            u -= v;
+            u >>= 1;
+            r += s;
+            s <<= 1;
+        } else {
+            v -= u;
+            v >>= 1;
+            s += r;
+            r <<= 1;
+        }
+        k++;
+    }
+
+    if (r >= opM) {
+        r -= opM;
+    }
+    r = opM - r;
+
+    k -= N;
+
+    for (int i = 0; i < k; i++) {
+        if (r[0] == 1) {
+            r += opM;
+        }
+        r >>= 1;
+    }
+
+    return r;
+}
+
+/**
+ * @brief return modular inverse of opA
+ * Reference: "The Montgomery Modular Inverse - Revisited" by E Savas, CK Koç
+ *
+ * @tparam N bit width of opA and opM, opM should no less than 2^(N-1)
+ *
+ * @param opA Input of modular inverse.
+ * @param opM Modulus of modular inverse.
+ */
+template <int N>
+ap_uint<N> modularInv(ap_uint<N> opA, ap_uint<N> opM) {
+    // calc r = opA^-1 * 2^k and k
+    ap_uint<N> u = opM;
+    ap_uint<N> v = opA;
+    ap_uint<N> s = 1;
+    ap_uint<N + 1> r = 0;
+    ap_uint<32> k = 0;
+
+    while (v > 0) {
+        if (u[0] == 0) {
+            u >>= 1;
+            s <<= 1;
+        } else if (v[0] == 0) {
+            v >>= 1;
+            r <<= 1;
+        } else if (u > v) {
+            u -= v;
+            u >>= 1;
+            r += s;
+            s <<= 1;
+        } else {
+            v -= u;
+            v >>= 1;
+            s += r;
+            r <<= 1;
+        }
+        k++;
+    }
+
+    if (r >= opM) {
+        r -= opM;
+    }
+    r = opM - r;
+
+    k -= N;
+
+    for (int i = 0; i < k; i++) {
+        if (r[0] == 1) {
+            r += opM;
+        }
+        r >>= 1;
+    }
+
+    ap_uint<N> res = monProduct<N>(r.range(N - 1, 0), 1, opM);
+
+    return res;
+}
+
+} // namespace internal
+} // namespace security
+} // namespace xf
+
+#endif
+// #include "xf_security/modular.hpp"
+
+namespace xf {
+namespace security {
+
+/**
+ * @brief RSA encryption/decryption class
+ *
+ * @tparam N BitWdith of modulus of key.
+ * @tparam L BitWdith of exponents of RSA encryption and decryption
+ */
+template <int N, int L>
+class rsa {
+   public:
+    ap_uint<L> exponent;
+    ap_uint<N> modulus;
+    ap_uint<N> rMod;
+
+    /**
+     * @brief Update key before use it to encrypt message
+     *
+     * @param inputModulus Modulus in RSA public key.
+     * @param inputExponent Exponent in RSA public key or private key.
+     */
+    void updateKey(ap_uint<N> inputModulus, ap_uint<L> inputExponent) {
+        modulus = inputModulus;
+        exponent = inputExponent;
+
+        ap_uint<N + 1> tmp = 0;
+        tmp[N] = 1;
+        tmp %= inputModulus;
+
+        rMod = xf::security::internal::productMod<N>(tmp, tmp, inputModulus);
+    }
+
+    /**
+     * @brief Update key before use it to encrypt message
+     *
+     * @param inputModulus Modulus in RSA public key.
+     * @param inputExponent Exponent in RSA public key or private key.
+     * @param inputRMod 2^(2 * N) mod modulus, pre-calculated by user
+     */
+    void updateKey(ap_uint<N> inputModulus, ap_uint<L> inputExponent, ap_uint<N> inputRMod) {
+        modulus = inputModulus;
+        exponent = inputExponent;
+        rMod = inputRMod;
+    }
+
+    /**
+     * @brief Encrypt message and get result. It does not include any padding scheme
+     *
+     * @param message Message to be encrypted/decrypted
+     * @param result Generated encrypted/decrypted result.
+     */
+    void process(ap_uint<N> message, ap_uint<N>& result) {
+        result = xf::security::internal::modularExp<N, L>(message, exponent, modulus, rMod);
+    }
+};
+
+} // namespace security
+} // namespace xf
+#endif
+
+//////
+
+void rsa_test(ap_uint<512> message, ap_uint<512> modulus, ap_uint<512> exponent, ap_uint<512>& result) {
+    xf::security::rsa<512, 512> processor;
+    processor.updateKey(modulus, exponent);
+    processor.process(message, result);
+}
+
+/*
+void sha256(hls::stream<AXIS_DATA>& input,
+			hls::stream<AXIS_DATA >& output) {
+	   // output: hash digest of input data
+
+// Interface definitions
+#pragma HLS INTERFACE ap_ctrl_none port=return // removes handshake
+#pragma HLS interface axis register port = input
+#pragma HLS interface axis register port = output
+#pragma HLS AGGREGATE variable=input bit
+#pragma HLS AGGREGATE variable=output bit
+
+	// We work on buffers of up to 64 bytes - hard-coded into SHA256 algorithm
+
+	// TODO
+	// change it later to the number of bits that are tkeep
+	AXIS_DATA currWord;
+	AXIS_DATA z;
+	z.tdata =0;
+	do {
+		input.read(currWord);
+		if(currWord.tlast != 1) {
+			z.tdata += currWord.tdata;
+		}
+	}while(currWord.tlast != 1);
+
+
+
+	AXIS_DATA outWord;
+	outWord.tlast=1;
+	outWord.tkeep = currWord.tkeep;
+	outWord.tid = currWord.tid;
+	outWord.tdata = z.tdata;
+	output.write(outWord);
+
+}
+*/
+
+void sha256(hls::stream<AXIS_DATA>& input,
+			hls::stream<AXIS_DATA >& output) {
+	   // output: hash digest of input data
+
+// Interface definitions
+#pragma HLS INTERFACE ap_ctrl_none port=return // removes handshake
+#pragma HLS interface axis register port = input
+#pragma HLS interface axis register port = output
+#pragma HLS AGGREGATE variable=input bit
+#pragma HLS AGGREGATE variable=output bit
+
+	// We work on buffers of up to 64 bytes - hard-coded into SHA256 algorithm
+	unsigned char seg_buf[64];	   // 64byte segment buffer
+#pragma HLS ARRAY_PARTITION dim=1 type=complete variable=seg_buf
+	int i=0;
+
+	// TODO
+	// change it later to the number of bits that are tkeep
+	unsigned int n = 64;
+	AXIS_DATA currWord;
+
+	// Initialize the SHA256 context
+	SHA256_CTX sha256ctx;
+	sha256_init(&sha256ctx);
+	// Process the data (byte at a time...)
+	do {
+		input.read(currWord);
+		if(currWord.tlast != 1) {
+			for (i=0; i<n; i++) {
+				seg_buf[i] = currWord.tdata(8*(64-i)-1, 8*(64-1-i));
+	//			std::cout<<"SEG BUF i: "<<i <<"  "<<seg_buf[n-1-i]<<std::endl;
+			}
+			sha256_update(&sha256ctx, seg_buf, n);
+		}
+	}while(currWord.tlast != 1);
+
+	// Finish computing the hash (recycle FPGAbuf), and copy results back to proc mem
+	sha256_final(&sha256ctx, seg_buf);
+
+	AXIS_DATA outWord;
+	outWord.tlast=1;
+	outWord.tdata=0;
+	outWord.tkeep = currWord.tkeep;
+	outWord.tid = currWord.tid;
+	int FIRST_BYTE_TO_POPULATE = 32;
+	std::cout<<"SEG BUF: ";
+	for (i=0; i<32; i++) {
+#pragma HLS UNROLL
+		std::cout<<" "<<std::hex<<int(seg_buf[i]);
+		outWord.tdata(8*(FIRST_BYTE_TO_POPULATE-i)-1, 8*(FIRST_BYTE_TO_POPULATE-1-i)) = seg_buf[i];
+		//outWord.tkeep((FIRST_BYTE_TO_POPULATE-i)-1, (FIRST_BYTE_TO_POPULATE-1-i)) = 1;
+	}
+	output.write(outWord);
+
+}
+void sha256_verify(hls::stream<AXIS_DATA>& input,
+		hls::stream<ap_uint<1> >& output) {
+	   // output: hash digest of input data
+
+// Interface definitions
+#pragma HLS INTERFACE ap_ctrl_none port=return // removes handshake
+#pragma HLS interface axis register port = input
+#pragma HLS interface axis register port = output
+#pragma HLS AGGREGATE variable=input bit
+#pragma HLS AGGREGATE variable=output bit
+
+	// We work on buffers of up to 64 bytes - hard-coded into SHA256 algorithm
+	unsigned char seg_buf[64];	   // 64byte segment buffer
+#pragma HLS ARRAY_PARTITION dim=1 type=complete variable=seg_buf
+	int i=0;
+
+	// TODO
+	// change it later to the number of bits that are tkeep
+	unsigned int n = 64;
+
+	AXIS_DATA currWord;
+	// Initialize the SHA256 context
+	SHA256_CTX sha256ctx;
+	sha256_init(&sha256ctx);
+	// Process the data (byte at a time...)
+	do {
+		input.read(currWord);
+		if(currWord.tlast != 1) {
+			for (i=0; i<n; i++) {
+				seg_buf[i] = currWord.tdata(8*(64-i)-1, 8*(64-1-i));
+	//			std::cout<<"SEG BUF i: "<<i <<"  "<<seg_buf[n-1-i]<<std::endl;
+			}
+			sha256_update(&sha256ctx, seg_buf, n);
+		}
+	}while(currWord.tlast != 1);
+
+	// Finish computing the hash (recycle FPGAbuf), and copy results back to proc mem
+	sha256_final(&sha256ctx, seg_buf);
+
+	AXIS_DATA outWord;
+	outWord.tlast=1;
+	outWord.tdata=0;
+	outWord.tkeep = currWord.tkeep;
+	outWord.tid = currWord.tid;
+	int FIRST_BYTE_TO_POPULATE = 32;
+	ap_uint<1> result = 0;
+	std::cout<<"SEG BUF ";
+
+	for (i=0; i<32; i++) {
+#pragma HLS UNROLL
+		if (seg_buf[i] != currWord.tdata(8*(FIRST_BYTE_TO_POPULATE-i)-1, 8*(FIRST_BYTE_TO_POPULATE-1-i))) {
+			result = 1;
+//			std::cout<<"\nDIFFER i "<<i<<" "<< int(seg_buf[i])<< " "<< outWord.tdata(8*(FIRST_BYTE_TO_POPULATE-i)-1, 8*(FIRST_BYTE_TO_POPULATE-1-i))<< std::endl;
+		}
+		std::cout<<" "<<std::hex<<int(seg_buf[i]);
+	}
+	output.write(result);
+}
+/*
+void sha256_verify(hls::stream<AXIS_DATA>& input,
+		hls::stream<ap_uint<1> >& output) {
+	   // output: hash digest of input data
+
+// Interface definitions
+#pragma HLS INTERFACE ap_ctrl_none port=return // removes handshake
+#pragma HLS interface axis register port = input
+#pragma HLS interface axis register port = output
+#pragma HLS AGGREGATE variable=input bit
+#pragma HLS AGGREGATE variable=output bit
+
+
+	AXIS_DATA currWord;
+	AXIS_DATA z;
+	z.tdata =0;
+	do {
+		input.read(currWord);
+		if(currWord.tlast != 1) {
+			z.tdata += currWord.tdata;
+		}
+	}while(currWord.tlast != 1);
+	ap_uint<1> result = 0;
+	if (currWord.tdata != z.tdata) {
+		result = 1;
+	}
+	output.write(result);
+
+}
+
+*/
